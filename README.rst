@@ -462,6 +462,40 @@ Random "R" definition keywords are supported, and remain consistent only within 
     datetime.datetime(2021, 4, 11, 4, 19)
 
 
+Snapshots and checkpoints
+=========================
+
+A ``croniter`` instance advances its cursor on every ``get_next``/``get_prev``,
+so a long-running job that must resume after a restart needs more than the last
+returned time. ``snapshot()`` captures the full iterator state as plain
+JSON-serializable data (no pickle, no object identities): the expression, the
+direction-independent current time, the timezone and fold, the hash seed, the
+resolved ``H``/``R`` random state, and behavior options such as ``day_or``.
+``croniter.restore()`` resumes from it, in this or another process, exactly
+where the original instance left off. Taking a snapshot never advances the
+cursor, identical states produce byte-identical JSON, and snapshots are
+validated strictly on restore: unknown versions, missing fields, and tampered
+data raise ``CroniterSnapshotError``. croniter never writes files itself;
+storing the checkpoint is up to the caller.
+
+.. code-block:: python
+
+    import json
+    from datetime import datetime
+
+    from croniter import croniter
+
+    it = croniter("*/30 * * * *", datetime(2024, 1, 1, 0, 0))
+    it.get_next()  # advance the cursor
+
+    # Checkpoint: plain JSON data the caller may store anywhere.
+    checkpoint = json.dumps(it.snapshot(), sort_keys=True)
+
+    # ... later, possibly in another process ...
+    restored = croniter.restore(json.loads(checkpoint))
+    assert restored.get_next(datetime) == it.get_next(datetime)
+
+
 Note about Ranges
 =================
 

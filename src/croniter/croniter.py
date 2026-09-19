@@ -3,6 +3,8 @@ import binascii
 import calendar
 import copy
 import datetime
+import hashlib
+import json
 import math
 import platform
 import random
@@ -261,6 +263,267 @@ class CroniterNotAlphaError(CroniterBadCronError):
     """Cron syntax contains an invalid day or month abbreviation"""
 
 
+class CroniterSnapshotError(CroniterError):
+    """Snapshot data is missing, malformed, tampered with, or unsupported"""
+
+
+SNAPSHOT_KIND = "croniter-snapshot"
+SNAPSHOT_VERSION = 1
+
+_SNAPSHOT_FIELDS = {
+    "kind",
+    "version",
+    "digest",
+    "expressions",
+    "expanded",
+    "nth_weekday_of_month",
+    "nearest_weekday",
+    "cur",
+    "is_prev",
+    "fold",
+    "timezone",
+    "hash_id",
+    "ret_type",
+    "options",
+}
+
+_SNAPSHOT_OPTION_FIELDS = {
+    "day_or",
+    "implement_cron_bug",
+    "second_at_beginning",
+    "expand_from_start_time",
+    "max_years_between_matches",
+    "max_years_between_matches_explicitly_set",
+}
+
+
+def _snapshot_digest(payload: dict) -> str:
+    """Return a stable digest of a snapshot payload (its ``digest`` field excluded).
+
+    The canonical form (sorted keys, tight separators) makes the digest
+    independent of dict insertion order, so identical states always produce
+    identical bytes.
+    """
+    body = {key: value for key, value in payload.items() if key != "digest"}
+    canonical = json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _describe_tzinfo(tzinfo: Optional[datetime.tzinfo]) -> Optional[dict]:
+    """Describe a tzinfo as plain JSON data, or raise CroniterSnapshotError.
+
+    Only timezones whose rules can be named or exactly reproduced are
+    representable: zoneinfo.ZoneInfo, pytz zones, and fixed-offset timezones
+    (datetime.timezone, dateutil tzutc/tzoffset). Anything else is rejected
+    rather than silently approximated.
+    """
+    if tzinfo is None:
+        return None
+    key = getattr(tzinfo, "key", None)  # zoneinfo.ZoneInfo
+    if isinstance(key, str):
+        return {"kind": "zoneinfo", "name": key}
+    zone = getattr(tzinfo, "zone", None)  # pytz, base or localized instance
+    if isinstance(zone, str) and hasattr(tzinfo, "localize"):
+        return {"kind": "pytz", "name": zone}
+    offset = None
+    if isinstance(tzinfo, datetime.timezone):
+        offset = tzinfo.utcoffset(None)
+    elif isinstance(tzinfo, tzutc):
+        offset = datetime.timedelta(0)
+    else:
+        # pylint: disable-next=import-outside-toplevel
+        from dateutil.tz import tzoffset
+
+        if isinstance(tzinfo, tzoffset):
+            offset = tzinfo.utcoffset(None)
+    if offset is None:
+        raise CroniterSnapshotError(
+            f"timezone {tzinfo!r} cannot be represented in a snapshot; "
+            "use zoneinfo.ZoneInfo, pytz, or a fixed-offset timezone"
+        )
+    seconds = offset.total_seconds()
+    seconds = int(seconds) if seconds == int(seconds) else seconds
+    return {"kind": "fixed", "offset": seconds}
+
+
+def _tzinfo_from_description(description: Optional[dict]) -> Optional[datetime.tzinfo]:
+    """Rebuild a tzinfo from its snapshot description (already validated)."""
+    if description is None:
+        return None
+    kind = description["kind"]
+    if kind == "zoneinfo":
+        # pylint: disable-next=import-outside-toplevel
+        import zoneinfo
+
+        return zoneinfo.ZoneInfo(description["name"])
+    if kind == "pytz":
+        # pylint: disable-next=import-outside-toplevel
+        import pytz
+
+        return pytz.timezone(description["name"])
+    # kind == "fixed"
+    return datetime.timezone(datetime.timedelta(seconds=description["offset"]))
+
+
+def _encode_hash_id(hash_id: Optional[bytes]) -> Optional[dict]:
+    """Encode a hash_id (bytes or None) as plain JSON data."""
+    if hash_id is None:
+        return None
+    try:
+        return {"encoding": "utf-8", "value": hash_id.decode("utf-8")}
+    except UnicodeDecodeError:
+        return {"encoding": "hex", "value": binascii.hexlify(hash_id).decode("ascii")}
+
+
+def _decode_hash_id(data: Optional[dict]) -> Optional[bytes]:
+    """Decode a snapshot hash_id back to bytes (input already validated)."""
+    if data is None:
+        return None
+    if data["encoding"] == "utf-8":
+        return data["value"].encode("utf-8")
+    return binascii.unhexlify(data["value"].encode("ascii"))
+
+
+def _is_int(value) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _validate_snapshot(snapshot: dict) -> None:
+    """Raise CroniterSnapshotError unless *snapshot* is a well-formed snapshot dict.
+
+    Validation is strict: the exact field set is required, the version must be
+    supported, the digest must match the payload, and every value must have the
+    expected type and range.
+    """
+
+    def fail(msg):
+        raise CroniterSnapshotError(msg)
+
+    if not isinstance(snapshot, dict):
+        fail(f"snapshot must be a dict, got {type(snapshot).__name__}")
+    keys = set(snapshot)
+    missing = _SNAPSHOT_FIELDS - keys
+    if missing:
+        fail(f"snapshot is missing field(s): {', '.join(sorted(missing))}")
+    unknown = keys - _SNAPSHOT_FIELDS
+    if unknown:
+        fail(f"snapshot has unknown field(s): {', '.join(sorted(unknown))}")
+    if snapshot["kind"] != SNAPSHOT_KIND:
+        fail(f"not a croniter snapshot (kind={snapshot['kind']!r})")
+    version = snapshot["version"]
+    if not _is_int(version) or version != SNAPSHOT_VERSION:
+        fail(f"unsupported snapshot version: {version!r}")
+    digest = snapshot["digest"]
+    if not isinstance(digest, str) or digest != _snapshot_digest(snapshot):
+        fail("snapshot digest mismatch: data was tampered with or corrupted")
+
+    cur = snapshot["cur"]
+    if isinstance(cur, bool) or not isinstance(cur, (int, float)) or not math.isfinite(cur):
+        fail(f"snapshot cur must be a finite number, got {cur!r}")
+    if not isinstance(snapshot["is_prev"], bool):
+        fail("snapshot is_prev must be a boolean")
+    fold = snapshot["fold"]
+    if not _is_int(fold) or fold not in (0, 1):
+        fail(f"snapshot fold must be 0 or 1, got {fold!r}")
+    if snapshot["ret_type"] not in ("float", "datetime"):
+        fail(f"snapshot ret_type must be 'float' or 'datetime', got {snapshot['ret_type']!r}")
+
+    expressions = snapshot["expressions"]
+    if (
+        not isinstance(expressions, list)
+        or len(expressions) not in VALID_LEN_EXPRESSION
+        or not all(isinstance(expr, str) for expr in expressions)
+    ):
+        fail("snapshot expressions must be a list of 5, 6 or 7 strings")
+
+    expanded = snapshot["expanded"]
+    if not isinstance(expanded, list) or len(expanded) != len(expressions):
+        fail("snapshot expanded must be a list matching the expressions length")
+    for field_index, field in enumerate(expanded):
+        low, high = croniter.RANGES[field_index]
+        if not isinstance(field, list) or not field:
+            fail(f"snapshot expanded field {field_index} must be a non-empty list")
+        for item in field:
+            if item == "*":
+                continue
+            if item == "l" and field_index == DAY_FIELD:
+                continue
+            if not _is_int(item) or not low <= item <= high:
+                fail(f"snapshot expanded field {field_index} has invalid value {item!r}")
+
+    nth_weekday_of_month = snapshot["nth_weekday_of_month"]
+    if not isinstance(nth_weekday_of_month, dict):
+        fail("snapshot nth_weekday_of_month must be a dict")
+    for weekday, nths in nth_weekday_of_month.items():
+        if not isinstance(weekday, str) or not weekday.isdigit() or not 0 <= int(weekday) <= 6:
+            fail(f"snapshot nth_weekday_of_month has invalid weekday key {weekday!r}")
+        if not isinstance(nths, list) or not nths:
+            fail(f"snapshot nth_weekday_of_month[{weekday!r}] must be a non-empty list")
+        for nth in nths:
+            if nth != "l" and (not _is_int(nth) or not 1 <= nth <= 5):
+                fail(f"snapshot nth_weekday_of_month[{weekday!r}] has invalid value {nth!r}")
+
+    nearest_weekday = snapshot["nearest_weekday"]
+    if not isinstance(nearest_weekday, list):
+        fail("snapshot nearest_weekday must be a list")
+    for day in nearest_weekday:
+        if not _is_int(day) or not 1 <= day <= 31:
+            fail(f"snapshot nearest_weekday has invalid day {day!r}")
+
+    timezone = snapshot["timezone"]
+    if timezone is not None:
+        if not isinstance(timezone, dict):
+            fail("snapshot timezone must be null or a dict")
+        kind = timezone.get("kind")
+        if kind in ("zoneinfo", "pytz"):
+            if set(timezone) != {"kind", "name"} or not isinstance(timezone["name"], str) or not timezone["name"]:
+                fail(f"snapshot timezone {timezone!r} must have a non-empty name")
+        elif kind == "fixed":
+            offset = timezone.get("offset")
+            if (
+                set(timezone) != {"kind", "offset"}
+                or isinstance(offset, bool)
+                or not isinstance(offset, (int, float))
+                or not -24 * 3600 < offset < 24 * 3600
+            ):
+                fail(f"snapshot timezone {timezone!r} has an invalid offset")
+        else:
+            fail(f"snapshot timezone has unknown kind {kind!r}")
+
+    hash_id = snapshot["hash_id"]
+    if hash_id is not None:
+        if (
+            not isinstance(hash_id, dict)
+            or set(hash_id) != {"encoding", "value"}
+            or hash_id["encoding"] not in ("utf-8", "hex")
+            or not isinstance(hash_id["value"], str)
+        ):
+            fail(f"snapshot hash_id {hash_id!r} is malformed")
+        if hash_id["encoding"] == "hex":
+            try:
+                binascii.unhexlify(hash_id["value"].encode("ascii"))
+            except (binascii.Error, ValueError):
+                fail("snapshot hash_id hex value does not decode")
+
+    options = snapshot["options"]
+    if not isinstance(options, dict):
+        fail("snapshot options must be a dict")
+    if set(options) != _SNAPSHOT_OPTION_FIELDS:
+        fail(f"snapshot options must be exactly {sorted(_SNAPSHOT_OPTION_FIELDS)}")
+    for name in (
+        "day_or",
+        "implement_cron_bug",
+        "second_at_beginning",
+        "expand_from_start_time",
+        "max_years_between_matches_explicitly_set",
+    ):
+        if not isinstance(options[name], bool):
+            fail(f"snapshot option {name} must be a boolean")
+    max_years = options["max_years_between_matches"]
+    if not _is_int(max_years) or max_years < 1:
+        fail(f"snapshot option max_years_between_matches must be an int >= 1, got {max_years!r}")
+
+
 class croniter:
     MONTHS_IN_YEAR = 12
 
@@ -310,6 +573,7 @@ class croniter:
                 raise TypeError("hash_id must be bytes or UTF-8 string")
             if not isinstance(hash_id, bytes):
                 hash_id = hash_id.encode("UTF-8")
+        self._hash_id = hash_id
 
         self._max_years_btw_matches_explicitly_set = max_years_between_matches is not None
         if max_years_between_matches is None:
@@ -362,6 +626,144 @@ class croniter:
         if issubclass(ret_type, datetime.datetime):
             return self.timestamp_to_datetime(self.cur)
         return self.cur
+
+    def snapshot(self) -> dict:
+        """Capture the full iterator state as a JSON-serializable snapshot.
+
+        The returned dict holds everything needed to resume this exact
+        iteration later -- in this or another process -- including the cron
+        expression, the direction-independent current time, the timezone and
+        fold, the hash seed (``hash_id``), the resolved state of the ``H``/``R``
+        (hash/random) extensions, and behavior options such as ``day_or``. It
+        contains only plain JSON data (dicts, lists, strings, numbers,
+        booleans, nulls): no pickles and no object identities. Identical
+        states always produce identical data, so
+        ``json.dumps(snapshot, sort_keys=True)`` is byte-stable.
+
+        Taking a snapshot never advances the cursor, and taking two snapshots
+        in a row returns equal data.
+
+        Use :meth:`restore` to resume from a snapshot. A typical checkpoint
+        looks like this:
+
+        >>> it = croniter("*/20 * * * *", datetime.datetime(2024, 1, 1, 0, 0))
+        >>> it.get_next(datetime.datetime)
+        datetime.datetime(2024, 1, 1, 0, 20)
+        >>> checkpoint = json.dumps(it.snapshot(), sort_keys=True)
+        >>> restored = croniter.restore(json.loads(checkpoint))
+        >>> restored.get_next(datetime.datetime)
+        datetime.datetime(2024, 1, 1, 0, 40)
+
+        croniter itself never writes files; storing ``checkpoint`` (a plain
+        JSON string) is up to the caller.
+        """
+        payload = {
+            "kind": SNAPSHOT_KIND,
+            "version": SNAPSHOT_VERSION,
+            "expressions": list(self.expressions),
+            "expanded": [list(field) for field in self.expanded],
+            "nth_weekday_of_month": {
+                str(weekday): sorted(nths, key=str)
+                for weekday, nths in sorted(self.nth_weekday_of_month.items(), key=lambda item: str(item[0]))
+            },
+            "nearest_weekday": sorted(self.nearest_weekday),
+            "cur": self.cur,
+            "is_prev": bool(self._is_prev),
+            "fold": self.timestamp_to_datetime(self.cur).fold,
+            "timezone": _describe_tzinfo(self.tzinfo),
+            "hash_id": _encode_hash_id(self._hash_id),
+            "ret_type": "datetime" if issubclass(self._ret_type, datetime.datetime) else "float",
+            "options": {
+                "day_or": bool(self._day_or),
+                "implement_cron_bug": bool(self._implement_cron_bug),
+                "second_at_beginning": bool(self.second_at_beginning),
+                "expand_from_start_time": bool(self._expand_from_start_time),
+                "max_years_between_matches": self._max_years_between_matches,
+                "max_years_between_matches_explicitly_set": bool(
+                    self._max_years_btw_matches_explicitly_set
+                ),
+            },
+        }
+        payload["digest"] = _snapshot_digest(payload)
+        return payload
+
+    @classmethod
+    def restore(cls, snapshot, tzinfo=MARKER) -> "croniter":
+        """Rebuild a croniter instance from a snapshot produced by :meth:`snapshot`.
+
+        ``snapshot`` may be the dict returned by :meth:`snapshot` or its JSON
+        string form. The restored instance continues ``get_next``/``get_prev``
+        (and switches between them) exactly as the original instance would
+        have, including across DST gaps and repeated wall-clock times.
+
+        The snapshot is validated strictly: an unknown ``version``, missing or
+        unknown fields, a digest mismatch (tampered or corrupted data), and
+        values outside their valid ranges all raise
+        :class:`CroniterSnapshotError`.
+
+        By default the timezone is reconstructed from the snapshot. If
+        ``tzinfo`` is given it must describe the same timezone rules as the
+        snapshot; a mismatch raises :class:`CroniterSnapshotError` instead of
+        silently converting between timezone rules.
+
+        >>> it = croniter("0 0 * * *", datetime.datetime(2024, 1, 1, 0, 0))
+        >>> snap = it.snapshot()
+        >>> croniter.restore(snap).get_next(datetime.datetime) == it.get_next(datetime.datetime)
+        True
+        >>> croniter.restore(dict(snap, version=999))
+        Traceback (most recent call last):
+        ...
+        croniter.croniter.CroniterSnapshotError: unsupported snapshot version: 999
+        """
+        if isinstance(snapshot, (str, bytes)):
+            try:
+                snapshot = json.loads(snapshot)
+            except ValueError as exc:
+                raise CroniterSnapshotError(f"snapshot is not valid JSON: {exc}") from exc
+        _validate_snapshot(snapshot)
+
+        stored_tzinfo = snapshot["timezone"]
+        if tzinfo is MARKER:
+            resolved_tzinfo = _tzinfo_from_description(stored_tzinfo)
+        else:
+            if _describe_tzinfo(tzinfo) != stored_tzinfo:
+                raise CroniterSnapshotError(
+                    "provided tzinfo does not match the timezone rules stored in the "
+                    "snapshot; refusing to silently convert between timezone rules"
+                )
+            resolved_tzinfo = tzinfo
+
+        options = snapshot["options"]
+        obj = cls.__new__(cls)
+        obj._ret_type = datetime.datetime if snapshot["ret_type"] == "datetime" else float
+        obj._day_or = options["day_or"]
+        obj._implement_cron_bug = options["implement_cron_bug"]
+        obj.second_at_beginning = options["second_at_beginning"]
+        obj._expand_from_start_time = options["expand_from_start_time"]
+        obj._max_years_btw_matches_explicitly_set = options[
+            "max_years_between_matches_explicitly_set"
+        ]
+        obj._max_years_between_matches = options["max_years_between_matches"]
+        obj._hash_id = _decode_hash_id(snapshot["hash_id"])
+        obj.tzinfo = resolved_tzinfo
+        obj.cur = float(snapshot["cur"])
+        obj.start_time = obj.cur
+        obj.dst_start_time = obj.cur
+        obj.expanded = [list(field) for field in snapshot["expanded"]]
+        obj.nth_weekday_of_month = {
+            int(weekday): set(nths) for weekday, nths in snapshot["nth_weekday_of_month"].items()
+        }
+        obj.expressions = list(snapshot["expressions"])
+        obj.nearest_weekday = set(snapshot["nearest_weekday"])
+        obj.fields = CRON_FIELDS[len(obj.expanded)]
+        obj._is_prev = snapshot["is_prev"]
+        fold = obj.timestamp_to_datetime(obj.cur).fold
+        if fold != snapshot["fold"]:
+            raise CroniterSnapshotError(
+                f"snapshot fold ({snapshot['fold']}) is inconsistent with cur and "
+                f"timezone (recomputed fold is {fold})"
+            )
+        return obj
 
     def set_current(
         self, start_time: Optional[Union[datetime.datetime, float]], force: bool = True
