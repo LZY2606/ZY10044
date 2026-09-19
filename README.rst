@@ -343,6 +343,37 @@ A worked example::
      datetime.datetime(2024, 9, 8, 0, 0)]
 
 
+Snapshots and checkpointing
+===========================
+A ``croniter`` iterator can be checkpointed into JSON-serializable plain data
+with ``snapshot()`` and resumed later -- even in another process or after a
+restart -- from the exact same position with ``from_snapshot()``. The snapshot
+records everything iteration depends on: the expression, the current
+timestamp, the timezone and ``fold``, the ``hash_id`` seed, the resolved
+state of ``H``/``R`` (hash/random) expansions, and behavioural options such as
+``day_or``. Taking a snapshot never advances the iterator, and snapshots of
+the same state are byte-identical. Unknown versions, missing fields, and
+corrupted or tampered data are rejected with ``CroniterSnapshotError``; the
+library itself never writes files -- persisting the JSON is up to the caller.
+
+.. code-block:: python
+
+    import datetime
+    import json
+
+    from croniter import croniter
+
+    # A long-running job iterates over a schedule...
+    cron = croniter("H/10 * * * *", datetime.datetime(2024, 1, 1, 0, 0), hash_id="job-7")
+    cron.get_next(datetime.datetime)
+
+    # Checkpoint: plain JSON data, safe to store anywhere.
+    checkpoint = json.dumps(cron.snapshot(), sort_keys=True)
+
+    # ...later, possibly in a fresh process after a restart:
+    resumed = croniter.from_snapshot(json.loads(checkpoint))
+    assert resumed.get_next(datetime.datetime) == cron.get_next(datetime.datetime)
+
 Testing if a date matches a crontab
 ===================================
 Test for a match with (>=0.3.32)::

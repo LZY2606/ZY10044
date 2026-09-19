@@ -1,8 +1,11 @@
 #!/usr/bin/env python
+import base64
 import binascii
 import calendar
 import copy
 import datetime
+import hashlib
+import json
 import math
 import platform
 import random
@@ -14,7 +17,7 @@ from time import time
 from typing import Any, Literal, Optional, Union
 
 from dateutil.relativedelta import relativedelta
-from dateutil.tz import datetime_exists, tzutc
+from dateutil.tz import datetime_exists, tzfile, tzutc
 
 ExpandedExpression = list[Union[int, Literal["*", "l"]]]
 
@@ -261,6 +264,194 @@ class CroniterNotAlphaError(CroniterBadCronError):
     """Cron syntax contains an invalid day or month abbreviation"""
 
 
+class CroniterSnapshotError(CroniterError):
+    """Snapshot data is missing, malformed, tampered with, or incompatible"""
+
+
+# Version of the snapshot data layout produced by croniter.snapshot() and
+# consumed by croniter.from_snapshot(). Bump on any incompatible change.
+SNAPSHOT_VERSION = 1
+
+_SNAPSHOT_REQUIRED_FIELDS = (
+    "version",
+    "expr_format",
+    "expressions",
+    "expanded",
+    "nth_weekday_of_month",
+    "nearest_weekday",
+    "current",
+    "start_time",
+    "dst_start_time",
+    "fold",
+    "timezone",
+    "hash_id",
+    "is_prev",
+    "ret_type",
+    "options",
+    "checksum",
+)
+
+_SNAPSHOT_OPTION_FIELDS = (
+    "day_or",
+    "max_years_between_matches",
+    "max_years_between_matches_explicitly_set",
+    "implement_cron_bug",
+    "second_at_beginning",
+    "expand_from_start_time",
+)
+
+
+def _snapshot_checksum(payload: dict) -> str:
+    """Return a stable integrity digest for a snapshot payload.
+
+    The payload is canonicalized with sorted keys and compact separators so
+    that the same logical state always produces the same digest bytes.
+    """
+    canonical = json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _serialize_tzinfo(tzinfo: Optional[datetime.tzinfo]) -> Optional[dict]:
+    """Return a JSON-serializable description of `tzinfo`.
+
+    Supports zoneinfo.ZoneInfo, pytz named zones and fixed offsets,
+    dateutil tzfile/tzutc, and datetime.timezone. Anything else raises
+    CroniterSnapshotError rather than being silently approximated.
+    """
+    if tzinfo is None:
+        return None
+    key = getattr(tzinfo, "key", None)  # zoneinfo.ZoneInfo
+    if isinstance(key, str):
+        return {"kind": "named", "provider": "zoneinfo", "name": key}
+    zone = getattr(tzinfo, "zone", None)  # pytz named zones
+    if isinstance(zone, str):
+        return {"kind": "named", "provider": "pytz", "name": zone}
+    if isinstance(tzinfo, datetime.timezone):
+        offset = tzinfo.utcoffset(None)
+        if offset is None:
+            raise CroniterSnapshotError(f"cannot serialize tzinfo {tzinfo!r} into a snapshot")
+        return {"kind": "fixed", "offset_seconds": offset.total_seconds()}
+    if isinstance(tzinfo, tzutc):
+        return {"kind": "fixed", "offset_seconds": 0}
+    if isinstance(tzinfo, tzfile):
+        filename = getattr(tzinfo, "_filename", "") or ""
+        parts = filename.replace("\\", "/").split("/")
+        if "zoneinfo" in parts:
+            index = len(parts) - 1 - parts[::-1].index("zoneinfo")
+            name = "/".join(parts[index + 1 :])
+            if name:
+                return {"kind": "named", "provider": "dateutil", "name": name}
+        raise CroniterSnapshotError(
+            f"cannot determine the IANA name of tzinfo {tzinfo!r} for a snapshot"
+        )
+    if type(tzinfo).__module__.split(".")[0] == "pytz":  # e.g. pytz.FixedOffset
+        offset = tzinfo.utcoffset(None)
+        if offset is not None:
+            return {"kind": "fixed", "offset_seconds": offset.total_seconds()}
+    raise CroniterSnapshotError(
+        f"tzinfo of type {type(tzinfo).__name__!r} cannot be serialized into a snapshot"
+    )
+
+
+def _deserialize_tzinfo(payload: Optional[dict]) -> Optional[datetime.tzinfo]:
+    """Rebuild a tzinfo from its serialized snapshot form."""
+    if payload is None:
+        return None
+    if not isinstance(payload, dict):
+        raise CroniterSnapshotError(f"snapshot 'timezone' field is malformed: {payload!r}")
+    kind = payload.get("kind")
+    if kind == "fixed":
+        offset = payload.get("offset_seconds")
+        if not isinstance(offset, (int, float)) or isinstance(offset, bool):
+            raise CroniterSnapshotError(f"snapshot 'timezone' field is malformed: {payload!r}")
+        return datetime.timezone(datetime.timedelta(seconds=offset))
+    if kind == "named":
+        name = payload.get("name")
+        provider = payload.get("provider")
+        if not isinstance(name, str) or not name:
+            raise CroniterSnapshotError(f"snapshot 'timezone' field is malformed: {payload!r}")
+        if provider == "zoneinfo":
+            try:
+                from zoneinfo import ZoneInfo
+            except ImportError as exc:
+                raise CroniterSnapshotError(
+                    "snapshot requires the 'zoneinfo' module to restore its timezone"
+                ) from exc
+            try:
+                return ZoneInfo(name)
+            except Exception as exc:
+                raise CroniterSnapshotError(
+                    f"snapshot timezone {name!r} cannot be loaded: {exc}"
+                ) from exc
+        if provider == "pytz":
+            try:
+                import pytz
+            except ImportError as exc:
+                raise CroniterSnapshotError(
+                    "snapshot requires the 'pytz' package to restore its timezone"
+                ) from exc
+            try:
+                return pytz.timezone(name)
+            except pytz.UnknownTimeZoneError as exc:
+                raise CroniterSnapshotError(
+                    f"snapshot timezone {name!r} is unknown to pytz"
+                ) from exc
+        if provider == "dateutil":
+            from dateutil.tz import gettz
+
+            tz = gettz(name)
+            if tz is None:
+                raise CroniterSnapshotError(f"snapshot timezone {name!r} is unknown to dateutil")
+            return tz
+        raise CroniterSnapshotError(
+            f"snapshot 'timezone' field has an unknown provider: {provider!r}"
+        )
+    raise CroniterSnapshotError(f"snapshot 'timezone' field has an unknown kind: {kind!r}")
+
+
+def _tz_rules_equal(a: Optional[dict], b: Optional[dict]) -> bool:
+    """Compare two serialized tzinfos by the rules they apply, not by provider."""
+    if a is None or b is None:
+        return a is None and b is None
+    if a.get("kind") != b.get("kind"):
+        return False
+    if a["kind"] == "named":
+        return a.get("name") == b.get("name")
+    return a.get("offset_seconds") == b.get("offset_seconds")
+
+
+def _serialize_hash_id(hash_id: Optional[bytes]) -> Optional[dict]:
+    """Return a JSON-serializable form of the hash seed."""
+    if hash_id is None:
+        return None
+    try:
+        return {"encoding": "utf-8", "data": hash_id.decode("UTF-8")}
+    except UnicodeDecodeError:
+        return {"encoding": "base64", "data": base64.b64encode(hash_id).decode("ascii")}
+
+
+def _deserialize_hash_id(payload: Optional[dict]) -> Optional[bytes]:
+    """Rebuild the hash seed from its serialized snapshot form."""
+    if payload is None:
+        return None
+    if not isinstance(payload, dict):
+        raise CroniterSnapshotError(f"snapshot 'hash_id' field is malformed: {payload!r}")
+    encoding = payload.get("encoding")
+    data = payload.get("data")
+    if not isinstance(data, str):
+        raise CroniterSnapshotError(f"snapshot 'hash_id' field is malformed: {payload!r}")
+    if encoding == "utf-8":
+        return data.encode("UTF-8")
+    if encoding == "base64":
+        try:
+            return base64.b64decode(data.encode("ascii"), validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise CroniterSnapshotError(
+                f"snapshot 'hash_id' field is malformed: {payload!r}"
+            ) from exc
+    raise CroniterSnapshotError(f"snapshot 'hash_id' field has an unknown encoding: {encoding!r}")
+
+
 class croniter:
     MONTHS_IN_YEAR = 12
 
@@ -310,6 +501,9 @@ class croniter:
                 raise TypeError("hash_id must be bytes or UTF-8 string")
             if not isinstance(hash_id, bytes):
                 hash_id = hash_id.encode("UTF-8")
+
+        self.expr_format = expr_format
+        self._hash_id = hash_id
 
         self._max_years_btw_matches_explicitly_set = max_years_between_matches is not None
         if max_years_between_matches is None:
@@ -375,6 +569,222 @@ class croniter:
             self.dst_start_time = start_time
             self.cur = start_time
         return self.cur
+
+    def snapshot(self) -> dict:
+        """Capture the complete iterator state as JSON-serializable plain data.
+
+        The returned dict contains only JSON-compatible values (dicts, lists,
+        strings, numbers, booleans and ``None``) -- no pickle payloads and no
+        object identities -- so it can be persisted with ``json.dumps`` and
+        later handed to :meth:`from_snapshot`, possibly in another process,
+        to resume iteration from the exact same position. It records
+        everything iteration depends on: the cron expression, the
+        direction-independent current timestamp, the timezone and the ``fold``
+        of the current time, the ``hash_id`` seed, the resolved state of
+        ``H``/``R`` (hash/random) expansions, and the behavioural options such
+        as ``day_or``.
+
+        Taking a snapshot never advances the iterator, and taking two
+        snapshots in a row yields byte-identical data for the same state.
+
+        Examples
+        --------
+        >>> import datetime, json
+        >>> cron = croniter("*/20 * * * *", datetime.datetime(2024, 1, 1, 0, 0))
+        >>> cron.get_next(datetime.datetime)
+        datetime.datetime(2024, 1, 1, 0, 20)
+        >>> blob = json.dumps(cron.snapshot(), sort_keys=True)
+        >>> restored = croniter.from_snapshot(json.loads(blob))
+        >>> restored.get_next(datetime.datetime) == cron.get_next(datetime.datetime)
+        True
+        """
+        current_dt = self.timestamp_to_datetime(self.cur)
+        payload = {
+            "version": SNAPSHOT_VERSION,
+            "expr_format": self.expr_format,
+            "expressions": list(self.expressions),
+            "expanded": [list(field) for field in self.expanded],
+            "nth_weekday_of_month": [
+                [key, sorted(values, key=str)]
+                for key, values in sorted(
+                    self.nth_weekday_of_month.items(), key=lambda item: str(item[0])
+                )
+            ],
+            "nearest_weekday": sorted(self.nearest_weekday),
+            "current": self.cur,
+            "start_time": self.start_time,
+            "dst_start_time": self.dst_start_time,
+            "fold": current_dt.fold,
+            "timezone": _serialize_tzinfo(self.tzinfo),
+            "hash_id": _serialize_hash_id(self._hash_id),
+            "is_prev": bool(self._is_prev),
+            "ret_type": "datetime" if issubclass(self._ret_type, datetime.datetime) else "float",
+            "options": {
+                "day_or": bool(self._day_or),
+                "max_years_between_matches": self._max_years_between_matches,
+                "max_years_between_matches_explicitly_set": (
+                    self._max_years_btw_matches_explicitly_set
+                ),
+                "implement_cron_bug": bool(self._implement_cron_bug),
+                "second_at_beginning": bool(self.second_at_beginning),
+                "expand_from_start_time": bool(self._expand_from_start_time),
+            },
+        }
+        payload["checksum"] = _snapshot_checksum(payload)
+        return payload
+
+    @classmethod
+    def from_snapshot(cls, snapshot: dict, tzinfo: Optional[datetime.tzinfo] = None) -> "croniter":
+        """Rebuild a croniter instance from a :meth:`snapshot` dict.
+
+        The restored instance continues ``get_next``/``get_prev`` iteration --
+        including switching directions -- exactly as the snapshotted instance
+        would have, across DST gaps and repeated local times.
+
+        ``CroniterSnapshotError`` is raised when the snapshot version is
+        unknown, a required field is missing, the integrity checksum does not
+        match (corrupted or tampered data), a field has an invalid shape, or
+        `tzinfo` is supplied whose rules are incompatible with the timezone
+        recorded in the snapshot (no silent conversion is performed).
+
+        Examples
+        --------
+        >>> import datetime
+        >>> cron = croniter("0 9 * * mon", datetime.datetime(2024, 1, 1, 0, 0))
+        >>> twin = croniter.from_snapshot(cron.snapshot())
+        >>> twin.get_next(datetime.datetime) == cron.get_next(datetime.datetime)
+        True
+        >>> croniter.from_snapshot({"version": 999})
+        Traceback (most recent call last):
+        ...
+        croniter.croniter.CroniterSnapshotError: unsupported snapshot version: 999
+        """
+        if not isinstance(snapshot, dict):
+            raise CroniterSnapshotError(
+                f"snapshot must be a dict of JSON-compatible data, got {type(snapshot).__name__}"
+            )
+        if "version" not in snapshot:
+            raise CroniterSnapshotError("snapshot is missing the 'version' field")
+        if snapshot["version"] != SNAPSHOT_VERSION:
+            raise CroniterSnapshotError(f"unsupported snapshot version: {snapshot['version']!r}")
+        missing = [field for field in _SNAPSHOT_REQUIRED_FIELDS if field not in snapshot]
+        if missing:
+            raise CroniterSnapshotError(
+                f"snapshot is missing required field(s): {', '.join(missing)}"
+            )
+        checksum = snapshot["checksum"]
+        payload = {key: value for key, value in snapshot.items() if key != "checksum"}
+        if not isinstance(checksum, str) or checksum != _snapshot_checksum(payload):
+            raise CroniterSnapshotError(
+                "snapshot checksum mismatch: data is corrupted or has been tampered with"
+            )
+
+        options = snapshot["options"]
+        if not isinstance(options, dict):
+            raise CroniterSnapshotError("snapshot 'options' field is malformed")
+        missing_options = [field for field in _SNAPSHOT_OPTION_FIELDS if field not in options]
+        if missing_options:
+            raise CroniterSnapshotError(
+                f"snapshot 'options' is missing field(s): {', '.join(missing_options)}"
+            )
+
+        stored_tz = snapshot["timezone"]
+        if tzinfo is not None and not _tz_rules_equal(_serialize_tzinfo(tzinfo), stored_tz):
+            raise CroniterSnapshotError(
+                "the provided tzinfo applies different timezone rules than the ones"
+                " recorded in the snapshot; refusing to silently convert"
+            )
+        restored_tzinfo = _deserialize_tzinfo(stored_tz)
+
+        def _fail(message):
+            raise CroniterSnapshotError(message)
+
+        expr_format = snapshot["expr_format"]
+        if not isinstance(expr_format, str):
+            _fail("snapshot 'expr_format' field is malformed")
+        expressions = snapshot["expressions"]
+        if not isinstance(expressions, list) or not all(
+            isinstance(expr, str) for expr in expressions
+        ):
+            _fail("snapshot 'expressions' field is malformed")
+        expanded = snapshot["expanded"]
+        if (
+            not isinstance(expanded, list)
+            or not expanded
+            or not all(isinstance(field, list) for field in expanded)
+            or not all(
+                isinstance(item, (int, str)) and not isinstance(item, bool)
+                for field in expanded
+                for item in field
+            )
+        ):
+            _fail("snapshot 'expanded' field is malformed")
+        try:
+            fields = CRON_FIELDS[len(expanded)]
+        except KeyError:
+            _fail(f"snapshot 'expanded' field has an invalid length: {len(expanded)}")
+        nth_weekday_of_month = {}
+        nth_pairs = snapshot["nth_weekday_of_month"]
+        if not isinstance(nth_pairs, list):
+            _fail("snapshot 'nth_weekday_of_month' field is malformed")
+        for pair in nth_pairs:
+            if (
+                not isinstance(pair, list)
+                or len(pair) != 2
+                or not isinstance(pair[0], (int, str))
+                or isinstance(pair[0], bool)
+                or not isinstance(pair[1], list)
+            ):
+                _fail("snapshot 'nth_weekday_of_month' field is malformed")
+            nth_weekday_of_month[pair[0]] = set(pair[1])
+        nearest_weekday = snapshot["nearest_weekday"]
+        if not isinstance(nearest_weekday, list) or not all(
+            isinstance(day, int) and not isinstance(day, bool) for day in nearest_weekday
+        ):
+            _fail("snapshot 'nearest_weekday' field is malformed")
+        current = snapshot["current"]
+        if not isinstance(current, (int, float)) or isinstance(current, bool):
+            _fail("snapshot 'current' field is malformed")
+        fold = snapshot["fold"]
+        if fold not in (0, 1) or isinstance(fold, bool):
+            _fail("snapshot 'fold' field is malformed")
+        is_prev = snapshot["is_prev"]
+        if not isinstance(is_prev, bool):
+            _fail("snapshot 'is_prev' field is malformed")
+        ret_type_name = snapshot["ret_type"]
+        if ret_type_name not in ("float", "datetime"):
+            _fail(f"snapshot 'ret_type' field is malformed: {ret_type_name!r}")
+
+        self = cls.__new__(cls)
+        self.expr_format = expr_format
+        self._hash_id = _deserialize_hash_id(snapshot["hash_id"])
+        self._ret_type = datetime.datetime if ret_type_name == "datetime" else float
+        self._day_or = bool(options["day_or"])
+        self._implement_cron_bug = bool(options["implement_cron_bug"])
+        self.second_at_beginning = bool(options["second_at_beginning"])
+        self._expand_from_start_time = bool(options["expand_from_start_time"])
+        self._max_years_btw_matches_explicitly_set = bool(
+            options["max_years_between_matches_explicitly_set"]
+        )
+        self._max_years_between_matches = int(options["max_years_between_matches"])
+        self.tzinfo = restored_tzinfo
+        self.start_time = float(snapshot["start_time"])
+        self.dst_start_time = float(snapshot["dst_start_time"])
+        self.cur = float(current)
+        self.expanded = [list(field) for field in expanded]
+        self.nth_weekday_of_month = nth_weekday_of_month
+        self.expressions = list(expressions)
+        self.nearest_weekday = set(nearest_weekday)
+        self.fields = fields
+        self._is_prev = is_prev
+
+        restored_dt = self.timestamp_to_datetime(self.cur)
+        if restored_dt.fold != fold:
+            raise CroniterSnapshotError(
+                "snapshot 'fold' does not match the restored current time;"
+                " the data is inconsistent"
+            )
+        return self
 
     @staticmethod
     def datetime_to_timestamp(d: datetime.datetime) -> float:

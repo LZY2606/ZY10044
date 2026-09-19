@@ -4,6 +4,18 @@ Changelog
 6.3.0 (unreleased)
 ------------------
 
+Features
+~~~~~~~~
+- Add versioned snapshot/restore support: ``croniter.snapshot()`` captures the
+  complete iterator state (expression, current timestamp, timezone and ``fold``,
+  ``hash_id`` seed, resolved ``H``/``R`` hash/random expansions, and behavioural
+  options such as ``day_or``) as JSON-serializable plain data, and
+  ``croniter.from_snapshot()`` resumes iteration from the exact same position,
+  including across DST gaps and repeated local times. Snapshots never advance
+  the iterator and are byte-stable for the same state; unknown versions,
+  missing fields, tampered data, and caller-supplied timezones incompatible
+  with the snapshot are rejected with the new ``CroniterSnapshotError``.
+
 Bugfixes
 ~~~~~~~~
 - Fix ``get_next``/``get_prev`` raising ``CroniterBadDateError`` when day-of-month and day-of-week are both restricted and the day-of-month can never occur in the selected month (e.g. ``0 0 31 2 0``). Under the Vixie OR semantics the unsatisfiable side now contributes no dates instead of aborting the whole expression, and ``match()`` and ``croniter_range()``, which swallow the error, no longer return silently wrong results for these expressions. [b245ab6, #243, @semx, @MildlyMeticulous]
@@ -779,4 +791,3 @@ Other
 0.3.3 (2012-09-29)
 ------------------
 - proper packaging
-
