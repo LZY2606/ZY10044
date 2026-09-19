@@ -1,0 +1,6 @@
+services:
+  app:
+    build:
+      context: .
+      args:
+        BUILDKIT_INLINE_CACHE: "1"
